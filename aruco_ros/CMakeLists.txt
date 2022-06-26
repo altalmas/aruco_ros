@@ -39,6 +39,11 @@ include_directories(
 add_library(aruco_ros_utils src/aruco_ros_utils.cpp)
 target_link_libraries(aruco_ros_utils ${catkin_LIBRARIES})
 
+add_executable(single_mod src/simple_single_mod.cpp
+                      src/aruco_ros_utils.cpp)
+add_dependencies(single_mod ${PROJECT_NAME}_gencfg)
+target_link_libraries(single_mod ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
+                    
 add_executable(single src/simple_single.cpp
                       src/aruco_ros_utils.cpp)
 add_dependencies(single ${PROJECT_NAME}_gencfg)
