@@ -17,8 +17,24 @@ find_package(catkin REQUIRED COMPONENTS
   visualization_msgs
 )
 
+## Generate messages in the 'msg' folder
+add_message_files(
+  FILES
+  Point2D.msg
+  Marker.msg
+  MarkerArray.msg
+)
+
+## Generate added messages and services with any dependencies listed here
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+  geometry_msgs
+)
+
 generate_dynamic_reconfigure_options(
   cfg/ArucoThreshold.cfg
+  cfg/Detector.cfg
 )
 
 add_compile_options(-std=c++11)

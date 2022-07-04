@@ -34,7 +34,6 @@
  */
 
 #include <iostream>
-#include <aruco/aruco.h>
 #include <aruco/cvdrawingutils.h>
 
 #include <ros/ros.h>
@@ -48,25 +47,37 @@
 
 #include <dynamic_reconfigure/server.h>
 #include <aruco_ros/ArucoThresholdConfig.h>
+#include <aruco_ros/DetectorConfig.h>
+
+// ABD
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/aruco.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/calib3d/calib3d.hpp>
+
+#include <aruco_ros/Marker.h>
+#include <aruco_ros/MarkerArray.h>
+
+#include <unordered_set>
+
+using std::vector;
+using cv::Mat;
 
 class ArucoSimple
 {
 private:
   cv::Mat inImage;
   aruco::CameraParameters camParam;
-  tf::StampedTransform rightToLeft;
   bool useRectifiedImages;
   aruco::MarkerDetector mDetector;
   std::vector<aruco::Marker> markers;
   ros::Subscriber cam_info_sub;
   bool cam_info_received;
-  image_transport::Publisher image_pub;
   image_transport::Publisher debug_pub;
-  ros::Publisher pose_pub;
   ros::Publisher transform_pub;
-  ros::Publisher position_pub;
   ros::Publisher marker_pub; // rviz visualization marker
-  ros::Publisher pixel_pub;
+  ros::Publisher simple_pose_pub; // important
   std::string marker_frame;
   std::string camera_frame;
   std::string reference_frame;
@@ -77,19 +88,25 @@ private:
   ros::NodeHandle nh;
   image_transport::ImageTransport it;
   image_transport::Subscriber image_sub;
-
-  tf::TransformListener _tfListener;
-
   dynamic_reconfigure::Server<aruco_ros::ArucoThresholdConfig> dyn_rec_server;
+  
+  // ABD
+  cv::Ptr<cv::aruco::Dictionary> dictionary_;
+  cv::Ptr<cv::aruco::DetectorParameters> parameters_;
+  std::shared_ptr<dynamic_reconfigure::Server<aruco_ros::DetectorConfig>> dyn_srv_;
+  bool enabled_ = true;
+  Mat camera_matrix_, dist_coeffs_;
+  aruco_ros::MarkerArray array_;
+  bool send_tf_;
+  std::unordered_set<int> map_markers_ids_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
+  std::string frame_id_prefix_;
+  geometry_msgs::PoseStamped simple_pose_;
 
 public:
   ArucoSimple() :
       cam_info_received(false), nh("~"), it(nh)
   {
-
-    if (nh.hasParam("corner_refinement"))
-      ROS_WARN(
-          "Corner refinement options have been removed in ArUco 3.0.0, corner_refinement ROS parameter is deprecated");
 
     aruco::MarkerDetector::Params params = mDetector.getParameters();
     std::string thresh_method;
@@ -128,16 +145,13 @@ public:
     image_sub = it.subscribe("/image", 1, &ArucoSimple::image_callback, this);
     cam_info_sub = nh.subscribe("/camera_info", 1, &ArucoSimple::cam_info_callback, this);
 
-    image_pub = it.advertise("result", 1);
     debug_pub = it.advertise("debug", 1);
-    pose_pub = nh.advertise<geometry_msgs::PoseStamped>("pose", 100);
     transform_pub = nh.advertise<geometry_msgs::TransformStamped>("transform", 100);
-    position_pub = nh.advertise<geometry_msgs::Vector3Stamped>("position", 100);
     marker_pub = nh.advertise<visualization_msgs::Marker>("marker", 10);
-    pixel_pub = nh.advertise<geometry_msgs::PointStamped>("pixel", 10);
-
+	simple_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("simple_pose", 1);
+		
     nh.param<double>("marker_size", marker_size, 0.05);
-    nh.param<int>("marker_id", marker_id, 300);
+    nh.param<int>("marker_id", marker_id, 6);
     nh.param<std::string>("reference_frame", reference_frame, "");
     nh.param<std::string>("camera_frame", camera_frame, "");
     nh.param<std::string>("marker_frame", marker_frame, "");
@@ -152,42 +166,30 @@ public:
     ROS_INFO("ArUco node will publish pose to TF with %s as parent and %s as child.", reference_frame.c_str(),
              marker_frame.c_str());
 
+    // TODO : check later for explanation
     dyn_rec_server.setCallback(boost::bind(&ArucoSimple::reconf_callback, this, _1, _2));
-  }
-
-  bool getTransform(const std::string& refFrame, const std::string& childFrame, tf::StampedTransform& transform)
-  {
-    std::string errMsg;
-
-    if (!_tfListener.waitForTransform(refFrame, childFrame, ros::Time(0), ros::Duration(0.5), ros::Duration(0.01),
-                                      &errMsg))
-    {
-      ROS_ERROR_STREAM("Unable to get pose from TF: " << errMsg);
-      return false;
-    }
-    else
-    {
-      try
-      {
-        _tfListener.lookupTransform(refFrame, childFrame, ros::Time(0), // get latest available
-                                    transform);
-      }
-      catch (const tf::TransformException& e)
-      {
-        ROS_ERROR_STREAM("Error in lookupTransform of " << childFrame << " in " << refFrame);
-        return false;
-      }
-
-    }
-    return true;
+    
+    // ABD
+    int dictionary;
+	dictionary = nh.param("dictionary", 10);
+    dictionary_ = cv::aruco::getPredefinedDictionary(static_cast<cv::aruco::PREDEFINED_DICTIONARY_NAME>(dictionary));
+	parameters_ = cv::aruco::DetectorParameters::create();
+	
+	dyn_srv_ = std::make_shared<dynamic_reconfigure::Server<aruco_ros::DetectorConfig>>(nh);
+	dyn_srv_->setCallback(std::bind(&ArucoSimple::paramCallback, this, std::placeholders::_1, std::placeholders::_2));
+	
+	camera_matrix_ = cv::Mat::zeros(3, 3, CV_64F);
+	send_tf_ = nh.param("send_tf", true);
+	br_.reset(new tf2_ros::TransformBroadcaster());
+	frame_id_prefix_ = nh.param<std::string>("frame_id_prefix", "aruco_");
+	
   }
 
   void image_callback(const sensor_msgs::ImageConstPtr& msg)
   {
-    if ((image_pub.getNumSubscribers() == 0) && (debug_pub.getNumSubscribers() == 0)
-        && (pose_pub.getNumSubscribers() == 0) && (transform_pub.getNumSubscribers() == 0)
-        && (position_pub.getNumSubscribers() == 0) && (marker_pub.getNumSubscribers() == 0)
-        && (pixel_pub.getNumSubscribers() == 0))
+    if ((debug_pub.getNumSubscribers() == 0)
+        && (transform_pub.getNumSubscribers() == 0)
+        && (marker_pub.getNumSubscribers() == 0))
     {
       ROS_DEBUG("No subscribers, not looking for ArUco markers");
       return;
@@ -197,80 +199,87 @@ public:
     if (cam_info_received)
     {
       ros::Time curr_stamp = msg->header.stamp;
-      cv_bridge::CvImagePtr cv_ptr;
       try
       {
-        cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::RGB8);
-        inImage = cv_ptr->image;
+        Mat inImage = cv_bridge::toCvShare(msg, "bgr8")->image;
+        
+        vector<int> ids;
+		vector<vector<cv::Point2f>> corners, rejected;
+		vector<cv::Vec3d> rvecs, tvecs;
 
         // detection results will go into "markers"
-        markers.clear();
+
         // ok, let's detect
-        mDetector.detect(inImage, markers, camParam, marker_size, false);
-        // for each marker, draw info and its boundaries in the image
-        for (std::size_t i = 0; i < markers.size(); ++i)
-        {
-          // only publishing the selected marker
-          //if (markers[i].id == marker_id)
-          //{
-            tf::Transform transform = aruco_ros::arucoMarker2Tf(markers[i]);
-            tf::StampedTransform cameraToReference;
-            cameraToReference.setIdentity();
+		cv::aruco::detectMarkers(inImage, dictionary_, corners, ids, parameters_, rejected);
+		
+		array_.header.stamp = msg->header.stamp;
+		// array_.header.frame_id = msg->header.frame_id;
+		array_.header.frame_id = marker_frame;
+		array_.markers.clear();
+		
+		if (ids.size() != 0) {
+			
+			// estimate the pose for each detected marker
+			cv::aruco::estimatePoseSingleMarkers(corners, marker_size, camera_matrix_, dist_coeffs_,
+				                                     rvecs, tvecs);
+				                                     
+		    array_.markers.reserve(ids.size());
+			aruco_ros::Marker marker;
+			geometry_msgs::TransformStamped transform;
+			transform.header.stamp = msg->header.stamp;
+			transform.header.frame_id = marker_frame;
+			
+			for (unsigned int i = 0; i < ids.size(); i++) {
+			    ROS_WARN("id = %d", ids[i]);
+			    
+				marker.id = ids[i];
+				marker.length = getMarkerLength(marker.id);
+				fillCorners(marker, corners[i]);
+				
+				fillPose(marker.pose, rvecs[i], tvecs[i]);
+				
+				if (send_tf_) {
+					transform.child_frame_id = getChildFrameId(ids[i]);
 
-            if (reference_frame != camera_frame)
-            {
-              getTransform(reference_frame, camera_frame, cameraToReference);
-            }
-
-            transform = static_cast<tf::Transform>(cameraToReference) * static_cast<tf::Transform>(rightToLeft)
-                * transform;
-
-            tf::StampedTransform stampedTransform(transform, curr_stamp, reference_frame, marker_frame);
-            br.sendTransform(stampedTransform);
-            geometry_msgs::PoseStamped poseMsg;
-            tf::poseTFToMsg(transform, poseMsg.pose);
-            poseMsg.header.frame_id = reference_frame;
-            poseMsg.header.stamp = curr_stamp;
-            pose_pub.publish(poseMsg);
-
-            geometry_msgs::TransformStamped transformMsg;
-            tf::transformStampedTFToMsg(stampedTransform, transformMsg);
-            transform_pub.publish(transformMsg);
-
-            geometry_msgs::Vector3Stamped positionMsg;
-            positionMsg.header = transformMsg.header;
-            positionMsg.vector = transformMsg.transform.translation;
-            position_pub.publish(positionMsg);
-
-            geometry_msgs::PointStamped pixelMsg;
-            pixelMsg.header = transformMsg.header;
-            pixelMsg.point.x = markers[i].getCenter().x;
-            pixelMsg.point.y = markers[i].getCenter().y;
-            pixelMsg.point.z = 0;
-            pixel_pub.publish(pixelMsg);
-
-            // publish rviz marker representing the ArUco marker patch
-            visualization_msgs::Marker visMarker;
-            visMarker.header = transformMsg.header;
-            visMarker.id = 1;
-            visMarker.type = visualization_msgs::Marker::CUBE;
-            visMarker.action = visualization_msgs::Marker::ADD;
-            visMarker.pose = poseMsg.pose;
-            visMarker.scale.x = marker_size;
-            visMarker.scale.y = marker_size;
-            visMarker.scale.z = 0.001;
-            visMarker.color.r = 1.0;
-            visMarker.color.g = 0;
-            visMarker.color.b = 0;
-            visMarker.color.a = 1.0;
-            visMarker.lifetime = ros::Duration(3.0);
-            marker_pub.publish(visMarker);
-
-          //}
-          // but drawing all the detected markers
-          markers[i].draw(inImage, cv::Scalar(0, 0, 255), 2);
+					// check if such static transform is in the map
+					if (map_markers_ids_.find(ids[i]) == map_markers_ids_.end()) {
+						transform.transform.rotation = marker.pose.orientation;
+						fillTranslation(transform.transform.translation, tvecs[i]);
+						br_->sendTransform(transform);
+					}
+				}
+				
+				array_.markers.push_back(marker);
+				
+				// publish the pose of the wanted marker only
+				if (ids[i] == marker_id){
+				    simple_pose_.header = transform.header;
+				    fillPose(simple_pose_.pose, rvecs[i], tvecs[i]);
+				    simple_pose_pub.publish(simple_pose_);
+				}
+			
+			}
+			
         }
+        
+        
+        // Publish debug image
+		if (debug_pub.getNumSubscribers() != 0) {
+			Mat debug = inImage.clone();
+			cv::aruco::drawDetectedMarkers(debug, corners, ids); // draw markers
+			for (unsigned int i = 0; i < ids.size(); i++)
+				cv::aruco::drawAxis(debug, camera_matrix_, dist_coeffs_,
+				                    rvecs[i], tvecs[i], getMarkerLength(ids[i]));
 
+			cv_bridge::CvImage out_msg;
+			out_msg.header.frame_id = marker_frame;
+			out_msg.header.stamp = msg->header.stamp;
+			out_msg.encoding = sensor_msgs::image_encodings::BGR8;
+			out_msg.image = debug;
+			debug_pub.publish(out_msg.toImageMsg());
+		}
+
+        // TODO: check later for explanation
         // draw a 3d cube in each marker if there is 3d info
         if (camParam.isValid() && marker_size != -1)
         {
@@ -280,25 +289,6 @@ public:
           }
         }
 
-        if (image_pub.getNumSubscribers() > 0)
-        {
-          // show input with augmented information
-          cv_bridge::CvImage out_msg;
-          out_msg.header.stamp = curr_stamp;
-          out_msg.encoding = sensor_msgs::image_encodings::RGB8;
-          out_msg.image = inImage;
-          image_pub.publish(out_msg.toImageMsg());
-        }
-
-        if (debug_pub.getNumSubscribers() > 0)
-        {
-          // show also the internal image resulting from the threshold operation
-          cv_bridge::CvImage debug_msg;
-          debug_msg.header.stamp = curr_stamp;
-          debug_msg.encoding = sensor_msgs::image_encodings::MONO8;
-          debug_msg.image = mDetector.getThresholdedImage();
-          debug_pub.publish(debug_msg.toImageMsg());
-        }
       }
       catch (cv_bridge::Exception& e)
       {
@@ -308,15 +298,80 @@ public:
     }
   }
 
+
+  inline void fillTranslation(geometry_msgs::Vector3& translation, const cv::Vec3d& tvec) const
+  {
+		translation.x = tvec[0];
+		translation.y = tvec[1];
+		translation.z = tvec[2];
+  }
+	
+  inline std::string getChildFrameId(int id) const
+  {
+		return frame_id_prefix_ + std::to_string(id);
+  }
+	
+  inline void fillPose(geometry_msgs::Pose& pose, const cv::Vec3d& rvec, const cv::Vec3d& tvec) const
+  {
+		pose.position.x = tvec[0];
+		pose.position.y = tvec[1];
+		pose.position.z = tvec[2];
+
+		double angle = norm(rvec);
+		cv::Vec3d axis = rvec / angle;
+
+		tf2::Quaternion q;
+		q.setRotation(tf2::Vector3(axis[0], axis[1], axis[2]), angle);
+
+		// change nan to 0.0 to avoid tf error
+		if (isnan(q.w()) || isnan(q.x()) || isnan(q.y()) || isnan(q.z()))
+		{
+			pose.orientation.w = 1.0;
+			pose.orientation.x = 0.0;
+			pose.orientation.y = 0.0;
+			pose.orientation.z = 0.0;
+		}
+		else
+		{
+			pose.orientation.w = q.w();
+			pose.orientation.x = q.x();
+			pose.orientation.y = q.y();
+			pose.orientation.z = q.z();
+		}
+  }
+	
+  inline double getMarkerLength(int id)
+  {
+	    return marker_size;
+  }
+  
+  inline void fillCorners(aruco_ros::Marker& marker, const vector<cv::Point2f>& corners) const
+  {
+		marker.c1.x = corners[0].x;
+		marker.c2.x = corners[1].x;
+		marker.c3.x = corners[2].x;
+		marker.c4.x = corners[3].x;
+		marker.c1.y = corners[0].y;
+		marker.c2.y = corners[1].y;
+		marker.c3.y = corners[2].y;
+		marker.c4.y = corners[3].y;
+  }
+	
+	
+  void parseCameraInfo(const sensor_msgs::CameraInfo& cinfo, cv::Mat& matrix, cv::Mat& dist)
+  {
+        for (unsigned int i = 0; i < 3; ++i)
+	        for (unsigned int j = 0; j < 3; ++j)
+		        matrix.at<double>(i, j) = cinfo.K[3 * i + j];
+        dist = cv::Mat(cinfo.D, true);
+        
+  }
+  
   // wait for one camerainfo, then shut down that subscriber
   void cam_info_callback(const sensor_msgs::CameraInfo &msg)
   {
     camParam = aruco_ros::rosCameraInfo2ArucoCamParams(msg, useRectifiedImages);
-
-    // handle cartesian offset between stereo pairs
-    // see the sensor_msgs/CameraInfo documentation for details
-    rightToLeft.setIdentity();
-    rightToLeft.setOrigin(tf::Vector3(-msg.P[3] / msg.P[0], -msg.P[7] / msg.P[5], 0.0));
+    parseCameraInfo(msg, camera_matrix_, dist_coeffs_);
 
     cam_info_received = true;
     cam_info_sub.shutdown();
@@ -330,6 +385,40 @@ public:
       ROS_WARN("normalizeImageIllumination is unimplemented!");
     }
   }
+  
+  void paramCallback(aruco_ros::DetectorConfig &config, uint32_t level)
+	{
+		enabled_ = config.enabled;
+		parameters_->adaptiveThreshConstant = config.adaptiveThreshConstant;
+		parameters_->adaptiveThreshWinSizeMin = config.adaptiveThreshWinSizeMin;
+		parameters_->adaptiveThreshWinSizeMax = config.adaptiveThreshWinSizeMax;
+		parameters_->adaptiveThreshWinSizeStep = config.adaptiveThreshWinSizeStep;
+		parameters_->cornerRefinementMaxIterations = config.cornerRefinementMaxIterations;
+		parameters_->cornerRefinementMethod = config.cornerRefinementMethod;
+		parameters_->cornerRefinementMinAccuracy = config.cornerRefinementMinAccuracy;
+		parameters_->cornerRefinementWinSize = config.cornerRefinementWinSize;
+#if ((CV_VERSION_MAJOR == 3) && (CV_VERSION_MINOR >= 4) && (CV_VERSION_REVISION >= 7)) || (CV_VERSION_MAJOR > 3)
+		parameters_->detectInvertedMarker = config.detectInvertedMarker;
+#endif
+		parameters_->errorCorrectionRate = config.errorCorrectionRate;
+		parameters_->minCornerDistanceRate = config.minCornerDistanceRate;
+		parameters_->markerBorderBits = config.markerBorderBits;
+		parameters_->maxErroneousBitsInBorderRate = config.maxErroneousBitsInBorderRate;
+		parameters_->minDistanceToBorder = config.minDistanceToBorder;
+		parameters_->minMarkerDistanceRate = config.minMarkerDistanceRate;
+		parameters_->minMarkerPerimeterRate = config.minMarkerPerimeterRate;
+		parameters_->maxMarkerPerimeterRate = config.maxMarkerPerimeterRate;
+		parameters_->minOtsuStdDev = config.minOtsuStdDev;
+		parameters_->perspectiveRemoveIgnoredMarginPerCell = config.perspectiveRemoveIgnoredMarginPerCell;
+		parameters_->perspectiveRemovePixelPerCell = config.perspectiveRemovePixelPerCell;
+		parameters_->polygonalApproxAccuracyRate = config.polygonalApproxAccuracyRate;
+#if ((CV_VERSION_MAJOR == 3) && (CV_VERSION_MINOR >= 4) && (CV_VERSION_REVISION >= 2)) || (CV_VERSION_MAJOR > 3)
+		parameters_->aprilTagQuadDecimate = config.aprilTagQuadDecimate;
+		parameters_->aprilTagQuadSigma = config.aprilTagQuadSigma;
+#endif
+	}
+	
+  
 };
 
 int main(int argc, char **argv)
