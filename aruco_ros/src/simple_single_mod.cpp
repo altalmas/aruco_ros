@@ -223,6 +223,18 @@ public:
 			cv::aruco::estimatePoseSingleMarkers(corners, marker_size, camera_matrix_, dist_coeffs_,
 				                                     rvecs, tvecs);
 				                                     
+		    //ROS_WARN("corners[0][0].x = %f", corners[0][0].x);
+	        //ROS_WARN("corners[0][0].y = %f", corners[0][0].y);
+	        
+	        //ROS_WARN("corners[0][1].x = %f", corners[0][1].x);
+	        //ROS_WARN("corners[0][1].y = %f", corners[0][1].y);
+	        
+	        //ROS_WARN("corners[0][2].x = %f", corners[0][2].x);
+	        //ROS_WARN("corners[0][2].y = %f", corners[0][2].y);
+	        
+	        //ROS_WARN("corners[0][3].x = %f", corners[0][3].x);
+	        //ROS_WARN("corners[0][3].y = %f", corners[0][3].y);
+		        
 		    array_.markers.reserve(ids.size());
 			aruco_ros::Marker marker;
 			geometry_msgs::TransformStamped transform;
@@ -230,7 +242,8 @@ public:
 			transform.header.frame_id = marker_frame;
 			
 			for (unsigned int i = 0; i < ids.size(); i++) {
-			    ROS_WARN("id = %d", ids[i]);
+			    ROS_WARN("id = %d", ids[i]);    // = 19
+			    //ROS_WARN("i = %d", i);        // = 0
 			    
 				marker.id = ids[i];
 				marker.length = getMarkerLength(marker.id);

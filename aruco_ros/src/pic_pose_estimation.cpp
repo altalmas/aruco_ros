@@ -55,6 +55,7 @@
 #include <opencv2/aruco.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
+#include <open_cv_fun/PicCorners.h>
 
 #include <aruco_ros/Marker.h>
 #include <aruco_ros/MarkerArray.h>
@@ -102,7 +103,11 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
   std::string frame_id_prefix_;
   geometry_msgs::PoseStamped simple_pose_;
-
+  ros::Subscriber corners_sub;
+  bool corners_ready = false;
+    
+  vector<vector<cv::Point2f>> corners;
+  
 public:
   ArucoSimple() :
       cam_info_received(false), nh("~"), it(nh)
@@ -144,6 +149,7 @@ public:
 
     image_sub = it.subscribe("/image", 1, &ArucoSimple::image_callback, this);
     cam_info_sub = nh.subscribe("/camera_info", 1, &ArucoSimple::cam_info_callback, this);
+    corners_sub = nh.subscribe("/corners",1, &ArucoSimple::corners_callback, this);
 
     debug_pub = it.advertise("debug", 1);
     transform_pub = nh.advertise<geometry_msgs::TransformStamped>("transform", 100);
@@ -187,57 +193,57 @@ public:
 
   void image_callback(const sensor_msgs::ImageConstPtr& msg)
   {
-    if ((debug_pub.getNumSubscribers() == 0)
-        && (transform_pub.getNumSubscribers() == 0)
-        && (marker_pub.getNumSubscribers() == 0))
-    {
-      ROS_DEBUG("No subscribers, not looking for ArUco markers");
-      return;
-    }
+  
+    //if ((debug_pub.getNumSubscribers() == 0)
+    //    && (transform_pub.getNumSubscribers() == 0)
+    //    && (marker_pub.getNumSubscribers() == 0))
+    //{
+    //  ROS_DEBUG("No subscribers, not looking for ArUco markers");
+    //  ROS_WARN("No subscribers, not looking for ArUco markers");
+    //  return;
+    //}
 
     static tf::TransformBroadcaster br;
     if (cam_info_received)
     {
       ros::Time curr_stamp = msg->header.stamp;
+      
+      
       try
       {
         Mat inImage = cv_bridge::toCvShare(msg, "bgr8")->image;
         
-        vector<int> ids;
-		vector<vector<cv::Point2f>> corners, rejected;
 		vector<cv::Vec3d> rvecs, tvecs;
 
-        // detection results will go into "markers"
-
-        // ok, let's detect
-		cv::aruco::detectMarkers(inImage, dictionary_, corners, ids, parameters_, rejected);
+		//cv::aruco::detectMarkers(inImage, dictionary_, corners, ids, parameters_, rejected);
 		
-		array_.header.stamp = msg->header.stamp;
-		// array_.header.frame_id = msg->header.frame_id;
-		array_.header.frame_id = marker_frame;
-		array_.markers.clear();
+		//array_.header.stamp = msg->header.stamp;
+		//array_.header.frame_id = marker_frame;
+		//array_.markers.clear();
 		
-		if (ids.size() != 0) {
+		if (corners_ready == true) {
+			//ROS_WARN("corners.size() = %d", (int)corners.size());
 			
 			// estimate the pose for each detected marker
 			cv::aruco::estimatePoseSingleMarkers(corners, marker_size, camera_matrix_, dist_coeffs_,
 				                                     rvecs, tvecs);
 				                                     
-		    array_.markers.reserve(ids.size());
-			aruco_ros::Marker marker;
+		    //array_.markers.reserve(corners.size());
+			//aruco_ros::Marker marker;
 			geometry_msgs::TransformStamped transform;
 			transform.header.stamp = msg->header.stamp;
 			transform.header.frame_id = marker_frame;
 			
-			for (unsigned int i = 0; i < ids.size(); i++) {
-			    ROS_WARN("id = %d", ids[i]);
+			for (unsigned int i = 0; i < corners.size(); i++) {
+			    //ROS_WARN("id = %d", ids[i]);
 			    
-				marker.id = ids[i];
-				marker.length = getMarkerLength(marker.id);
-				fillCorners(marker, corners[i]);
+				//marker.id = 0;//ids[i];
+				//marker.length = getMarkerLength(marker.id);
+				//fillCorners(marker, corners[i]);
 				
-				fillPose(marker.pose, rvecs[i], tvecs[i]);
+				//fillPose(marker.pose, rvecs[i], tvecs[i]);
 				
+				/*
 				if (send_tf_) {
 					transform.child_frame_id = getChildFrameId(ids[i]);
 
@@ -248,21 +254,21 @@ public:
 						br_->sendTransform(transform);
 					}
 				}
+				*/
 				
-				array_.markers.push_back(marker);
+				//array_.markers.push_back(marker);
 				
-				// publish the pose of the wanted marker only
-				if (ids[i] == marker_id){
-				    simple_pose_.header = transform.header;
-				    fillPose(simple_pose_.pose, rvecs[i], tvecs[i]);
-				    simple_pose_pub.publish(simple_pose_);
-				}
+				// publish the pose of the face box
+			    simple_pose_.header = transform.header;
+			    fillPose(simple_pose_.pose, rvecs[i], tvecs[i]);
+			    simple_pose_pub.publish(simple_pose_);
+				
 			
 			}
 			
         }
         
-        
+        /*
         // Publish debug image
 		if (debug_pub.getNumSubscribers() != 0) {
 			Mat debug = inImage.clone();
@@ -288,6 +294,8 @@ public:
             aruco::CvDrawingUtils::draw3dAxis(inImage, markers[i], camParam);
           }
         }
+        
+        */
 
       }
       catch (cv_bridge::Exception& e)
@@ -295,6 +303,7 @@ public:
         ROS_ERROR("cv_bridge exception: %s", e.what());
         return;
       }
+      
     }
   }
 
@@ -365,6 +374,39 @@ public:
 		        matrix.at<double>(i, j) = cinfo.K[3 * i + j];
         dist = cv::Mat(cinfo.D, true);
         
+  }
+  
+  void corners_callback(const open_cv_fun::PicCorners::ConstPtr& box){    // ->
+//  void corners_callback(const open_cv_fun::PicCorners &box){
+    // Assuming 4 corners only for 1 picture only
+    // vector< vector< cv::Point2f > > corners;     // remember
+    
+    corners.clear();
+    vector<cv::Point2f> c1;
+    
+    c1.push_back({(float)box->x1,(float)box->y1}); // x1,y1
+    c1.push_back({(float)box->x2,(float)box->y2}); // x2,y2
+    c1.push_back({(float)box->x3,(float)box->y3}); // x3,y3
+    c1.push_back({(float)box->x4,(float)box->y4}); // x4,y4
+    
+    corners.push_back(c1);
+    
+    /*
+    corners[0][0].x = (float)box->x1;
+    corners[0][0].y = (float)box->y1;
+    
+    corners[0][1].x = (float)box->x2;
+    corners[0][1].y = (float)box->y2;
+    
+    corners[0][2].x = (float)box->x3;
+    corners[0][2].y = (float)box->y3;
+    
+    corners[0][3].x = (float)box->x4;
+    corners[0][3].y = (float)box->y4;
+    */
+    
+    corners_ready = true;
+    
   }
   
   // wait for one camerainfo, then shut down that subscriber

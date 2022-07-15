@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
   aruco_msgs
   sensor_msgs
   visualization_msgs
+  open_cv_fun
 )
 
 ## Generate messages in the 'msg' folder
@@ -52,12 +53,13 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
 )
+
 add_library(aruco_ros_utils src/aruco_ros_utils.cpp)
 target_link_libraries(aruco_ros_utils ${catkin_LIBRARIES})
 
 add_executable(pic_pose_estimation src/pic_pose_estimation.cpp
                       src/aruco_ros_utils.cpp)
-add_dependencies(pic_pose_estimation ${PROJECT_NAME}_gencfg)
+add_dependencies(pic_pose_estimation ${PROJECT_NAME}_gencfg ${catkin_EXPORTED_TARGETS})
 target_link_libraries(pic_pose_estimation ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
 
 add_executable(single_mod src/simple_single_mod.cpp
